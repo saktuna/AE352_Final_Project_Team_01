@@ -1,0 +1,459 @@
+"""
+Quadcopter mission simulation and plotting.
+
+""" # Mission:
+# - Launch from ground, ascend vertically to z = 1.0 m
+#- Move straight at z = 1.0 m at average speed 1 m/s for 5 m
+# - Hover
+# - Yaw +90 deg left
+# - Move straight another 5 m
+# - Hover
+# - Land vertically with speed <= 0.01 m/s 
+
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+
+m_frame = 0.395         # kg
+m_motor_each = 0.047    # kg (per motor)
+m_motors = 4 * m_motor_each
+m_props_total = 0.055   # kg (total for 4)
+m_esc_each = 0.05       # kg (per ESC)
+m_escs = 4 * m_esc_each
+m_battery = 0.23        # kg
+m_fc = 0.31             # kg (flight controller)
+
+m_total = m_frame + m_motors + m_props_total + m_escs + m_battery + m_fc
+
+print(f"Total vehicle mass assumed: {m_total:.3f} kg")
+
+g = 9.81  # m/s^2
+# approximate rotational inertias (kg*m^2)
+Ixx = 0.02
+Iyy = 0.02
+Izz = 0.04
+
+# Prop / motor / battery parameters (NEW)
+# thrust and motor torque coefficients (typical small-quad values)
+kT = 1.8e-5    # thrust [N] = kT * omega^2 (omega in rad/s)
+kM = 2.5e-6    # torque constant used to estimate mech power: P_mech ~ kM * omega^3
+
+motor_efficiency = 0.72   # combined motor+ESC efficiency (electrical -> mechanical)
+
+# Battery: Spektrum 11.1V 2200mAh 3S 50C
+V_nom = 11.1             # nominal voltage
+capacity_Ah = 2.2        # Ah
+C_rating = 50            # continuous
+I_cont_max = capacity_Ah * C_rating    # A
+P_batt_max = V_nom * I_cont_max        # W (max continuous electric power available)
+E_batt_J = V_nom * capacity_Ah * 3600  # Joules stored (nominal)
+
+print(f"Battery max continuous current: {I_cont_max:.1f} A")
+print(f"Battery max continuous power: {P_batt_max:.1f} W")
+print(f"Battery nominal energy: {E_batt_J/3600:.2f} Wh ({E_batt_J:.0f} J)")
+
+
+Cd_trans = 0.15   # translational linear drag coefficient (N per (m/s))
+# simple damping model
+
+# Position controller gains (PD)
+Kp_xy = 6.0
+Kd_xy = 4.0
+
+Kp_z = 25.0
+Kd_z = 10.0
+
+# Attitude (angle) controller gains
+Kp_ang = np.array([8.0, 8.0, 3.0])   # [roll, pitch, yaw]
+Kd_ang = np.array([2.5, 2.5, 1.0])
+
+
+# Mission timing and reference generation
+t_up = 3.0
+t_cruise1 = 5.0
+t_hover1 = 2.0
+t_yaw = 2.0
+t_cruise2 = 5.0
+t_hover2 = 2.0
+t_land = 6.0
+
+dt = 0.02
+t_phases = [t_up, t_cruise1, t_hover1, t_yaw, t_cruise2, t_hover2, t_land]
+T_total = sum(t_phases)
+t = np.arange(0, T_total + dt/2, dt)
+
+x0, y0, z0 = 0.0, 0.0, 0.0
+z_hover = 1.0
+v_cruise = 1.0
+
+xref = np.zeros_like(t)
+yref = np.zeros_like(t)
+zref = np.zeros_like(t)
+vx_ref = np.zeros_like(t)
+vy_ref = np.zeros_like(t)
+vz_ref = np.zeros_like(t)
+yaw_ref = np.zeros_like(t)
+yaw_rate_ref = np.zeros_like(t)
+
+idx = 0
+current_x = x0
+current_y = y0
+current_yaw = 0.0
+
+for phase, dur in zip(["up","cruise1","hover1","yaw","cruise2","hover2","land"], t_phases):
+    n_steps = int(np.round(dur / dt))
+    times = np.arange(n_steps) * dt
+    if phase == "up":
+        z_traj = z0 + (z_hover - z0) * (times / dur)
+        vz_traj = (z_hover - z0) / dur * np.ones_like(times)
+        x_traj = current_x + 0*times
+        y_traj = current_y + 0*times
+        yaw_traj = current_yaw + 0*times
+    elif phase == "cruise1":
+        dx = v_cruise * times
+        x_traj = current_x + dx
+        vx_traj = v_cruise * np.ones_like(times)
+        y_traj = current_y + 0*times
+        z_traj = z_hover + 0*times
+        vz_traj = 0*times
+        yaw_traj = current_yaw + 0*times
+        vy_traj = 0*times
+    elif phase == "hover1":
+        x_traj = current_x + v_cruise * dur * np.ones_like(times)
+        vx_traj = 0*times
+        y_traj = current_y + 0*times
+        z_traj = z_hover + 0*times
+        vz_traj = 0*times
+        yaw_traj = current_yaw + 0*times
+        vy_traj = 0*times
+    elif phase == "yaw":
+        yaw_start = current_yaw
+        yaw_end = current_yaw + np.pi/2.0
+        yaw_traj = yaw_start + (yaw_end - yaw_start) * (times / dur)
+        yaw_rate_traj = (yaw_end - yaw_start) / dur * np.ones_like(times)
+        x_traj = current_x + v_cruise * dur * np.ones_like(times)
+        vx_traj = 0*times
+        y_traj = current_y + 0*times
+        z_traj = z_hover + 0*times
+        vz_traj = 0*times
+        vy_traj = 0*times
+    elif phase == "cruise2":
+        dy = v_cruise * times
+        x_traj = current_x + v_cruise * dur * np.ones_like(times)
+        y_traj = current_y + dy
+        vx_traj = 0*times
+        vy_traj = v_cruise * np.ones_like(times)
+        z_traj = z_hover + 0*times
+        vz_traj = 0*times
+        yaw_traj = current_yaw + np.pi/2.0 + 0*times
+    elif phase == "hover2":
+        x_traj = current_x + v_cruise * dur * np.ones_like(times)
+        y_traj = current_y + v_cruise * dur * np.ones_like(times)
+        vx_traj = 0*times
+        vy_traj = 0*times
+        z_traj = z_hover + 0*times
+        vz_traj = 0*times
+        yaw_traj = current_yaw + np.pi/2.0 + 0*times
+    elif phase == "land":
+        z_traj = z_hover * (1.0 - (times / dur)**2)
+        vz_traj = np.gradient(z_traj, dt)
+        x_traj = current_x + v_cruise * dur * np.ones_like(times)
+        y_traj = current_y + v_cruise * dur * np.ones_like(times)
+        vx_traj = 0*times
+        vy_traj = 0*times
+        yaw_traj = current_yaw + np.pi/2.0 + 0*times
+    else:
+        x_traj = current_x + 0*times
+        y_traj = current_y + 0*times
+        z_traj = z_hover + 0*times
+        vx_traj = 0*times
+        vy_traj = 0*times
+        vz_traj = 0*times
+        yaw_traj = current_yaw + 0*times
+
+    n_avail = len(times)
+    j0 = idx
+    j1 = idx + n_avail
+    if 'vx_traj' not in locals(): vx_traj = np.zeros(n_avail)
+    if 'vy_traj' not in locals(): vy_traj = np.zeros(n_avail)
+    if 'vz_traj' not in locals(): vz_traj = np.zeros(n_avail)
+    if 'yaw_traj' not in locals(): yaw_traj = np.zeros(n_avail)
+    if 'yaw_rate_traj' not in locals(): yaw_rate_traj = np.zeros(n_avail)
+
+    xref[j0:j1] = x_traj
+    yref[j0:j1] = y_traj
+    zref[j0:j1] = z_traj
+    vx_ref[j0:j1] = vx_traj
+    vy_ref[j0:j1] = vy_traj
+    vz_ref[j0:j1] = vz_traj
+    yaw_ref[j0:j1] = yaw_traj
+    yaw_rate_ref[j0:j1] = yaw_rate_traj
+
+    idx = j1
+    current_x = xref[j1-1]
+    current_y = yref[j1-1]
+    current_yaw = yaw_ref[j1-1]
+
+    for v in ['vx_traj','vy_traj','vz_traj','yaw_traj','yaw_rate_traj']:
+        if v in locals():
+            del locals()[v]
+
+# Dynamical model
+def wrap_angle(a):
+    return (a + np.pi) % (2*np.pi) - np.pi
+
+def dynamics(ti, state):
+    # linear interpolation of references at time ti
+    idx = int(np.floor(ti / dt))
+    if idx >= len(t): idx = len(t)-1
+    x_d = xref[idx]; y_d = yref[idx]; z_d = zref[idx]
+    vx_d = vx_ref[idx]; vy_d = vy_ref[idx]; vz_d = vz_ref[idx]
+    yaw_d = yaw_ref[idx]; yaw_rate_d = yaw_rate_ref[idx]
+
+    # unpack state
+    x, y, z, xd, yd, zd, phi, theta, psi, p, q, r = state
+
+    # position errors and derivative errors
+    ex = x_d - x
+    ey = y_d - y
+    ez = z_d - z
+    evx = vx_d - xd
+    evy = vy_d - yd
+    evz = vz_d - zd
+
+    # desired horizontal accelerations from PD
+    ax_des = Kp_xy * ex + Kd_xy * evx
+    ay_des = Kp_xy * ey + Kd_xy * evy
+    # desired vertical acceleration
+    az_des = Kp_z * ez + Kd_z * evz
+
+    # desired angles (small-angle mapping). Note: psi is current yaw used in transform
+    phi_des = (ax_des * np.sin(psi) - ay_des * np.cos(psi)) / g
+    theta_des = (ax_des * np.cos(psi) + ay_des * np.sin(psi)) / g
+    # clamp small angles
+    max_angle = np.radians(20.0)
+    phi_des = np.clip(phi_des, -max_angle, max_angle)
+    theta_des = np.clip(theta_des, -max_angle, max_angle)
+
+    # angle errors
+    e_phi = phi_des - phi
+    e_theta = theta_des - theta
+    # yaw error (wrap)
+    e_psi = wrap_angle(yaw_d - psi)
+
+    # PD for angular accelerations -> torques
+    ang_rates = np.array([p, q, r])
+    e_angles = np.array([e_phi, e_theta, e_psi])
+    tau = Kp_ang * e_angles - Kd_ang * ang_rates  # tau_x, tau_y, tau_z
+
+    # map torques to angular accelerations
+    p_dot = tau[0] / Ixx
+    q_dot = tau[1] / Iyy
+    r_dot = tau[2] / Izz
+
+    # thrust needed to produce desired vertical acceleration (in world Z)
+    cosphi = np.cos(phi); costheta = np.cos(theta)
+    denom = cosphi * costheta
+    if np.abs(denom) < 1e-6:
+        denom = 1e-6
+    T = m_total * (g + az_des) / denom
+    T = max(0.0, T)
+
+    # acceleration in inertial frame from thrust rotated by current Euler angles
+    # include simple translational drag proportional to velocity (linear damping)
+    ax = (T / m_total) * np.sin(theta) - (Cd_trans / m_total) * xd
+    ay = (T / m_total) * (-np.sin(phi) * np.cos(theta)) - (Cd_trans / m_total) * yd
+    az = (T / m_total) * (np.cos(phi) * np.cos(theta)) - g - (Cd_trans / m_total) * zd
+
+    # state derivatives
+    x_dot = xd
+    y_dot = yd
+    z_dot = zd
+    xd_dot = ax
+    yd_dot = ay
+    zd_dot = az
+
+    # Euler angle kinematics (body rates -> Euler derivatives)
+    phi_dot = p + q * np.sin(phi) * np.tan(theta) + r * np.cos(phi) * np.tan(theta)
+    theta_dot = q * np.cos(phi) - r * np.sin(phi)
+    psi_dot = q * np.sin(phi) / np.cos(theta) + r * np.cos(phi) / np.cos(theta)
+
+    return [x_dot, y_dot, z_dot, xd_dot, yd_dot, zd_dot, phi_dot, theta_dot, psi_dot, p_dot, q_dot, r_dot]
+
+# Initial state
+state0 = np.zeros(12)
+state0[2] = 0.0   # z
+
+# integrate
+sol = solve_ivp(dynamics, (0.0, T_total), state0, t_eval=t, rtol=1e-6, atol=1e-6)
+
+# extract results
+x = sol.y[0]
+y = sol.y[1]
+z = sol.y[2]
+xd = sol.y[3]
+yd = sol.y[4]
+zd = sol.y[5]
+phi = sol.y[6]
+theta = sol.y[7]
+psi = sol.y[8]
+p = sol.y[9]
+q = sol.y[10]
+r = sol.y[11]
+
+# Recompute per-time required thrusts and power (post-process)
+# Reuse the same control law used in dynamics to compute az_des -> T
+power_total = np.zeros_like(t)
+power_per_motor = np.zeros((len(t), 4))
+thrust_per_motor = np.zeros((len(t), 4))
+omega_per_motor = np.zeros((len(t), 4))
+energy_used = np.zeros_like(t)
+
+for i, ti in enumerate(t):
+    # get references
+    x_d = xref[i]; y_d = yref[i]; z_d = zref[i]
+    vx_d = vx_ref[i]; vy_d = vy_ref[i]; vz_d = vz_ref[i]
+    yaw_d = yaw_ref[i]
+
+    # current states (from solution)
+    xi = x[i]; yi = y[i]; zi = z[i]
+    xdi = xd[i]; ydi = yd[i]; zdi = zd[i]
+    phii = phi[i]; thetai = theta[i]; psii = psi[i]
+    pi = p[i]; qi = q[i]; ri = r[i]
+
+    # errors
+    ex = x_d - xi
+    ey = y_d - yi
+    ez = z_d - zi
+    evx = vx_d - xdi
+    evy = vy_d - ydi
+    evz = vz_d - zdi
+
+    ax_des = Kp_xy * ex + Kd_xy * evx
+    ay_des = Kp_xy * ey + Kd_xy * evy
+    az_des = Kp_z * ez + Kd_z * evz
+
+    phi_des = (ax_des * np.sin(psii) - ay_des * np.cos(psii)) / g
+    theta_des = (ax_des * np.cos(psii) + ay_des * np.sin(psii)) / g
+    max_angle = np.radians(20.0)
+    phi_des = np.clip(phi_des, -max_angle, max_angle)
+    theta_des = np.clip(theta_des, -max_angle, max_angle)
+
+    # compute total thrust required
+    cosphi = np.cos(phii); costheta = np.cos(thetai)
+    denom = cosphi * costheta
+    if np.abs(denom) < 1e-6:
+        denom = 1e-6
+    T_req = m_total * (g + az_des) / denom
+    T_req = max(0.0, T_req)
+
+    # per-rotor thrust (quad-X equally distributes thrust nominally)
+    Ti = T_req / 4.0
+    Ti = max(0.0, Ti)
+
+    # rotor speed from thrust constant
+    # protect from unrealistic values
+    omega_i = np.sqrt(np.clip(Ti / kT, 0, (5000.0)**2))  # rad/s (cap to a reasonable max)
+    # estimate mechanical power per rotor: P_mech ~ torque*omega ~ kM*omega^3
+    P_mech_i = kM * (omega_i**3)
+    # electrical power per rotor (account for efficiency)
+    P_elec_i = P_mech_i / max(motor_efficiency, 1e-3)
+
+    # store
+    thrust_per_motor[i,:] = Ti
+    omega_per_motor[i,:] = omega_i
+    power_per_motor[i,:] = P_elec_i
+    power_total[i] = np.sum(P_elec_i)
+
+    # integrate energy used (somewhat trapezoidal using dt)
+    if i == 0:
+        energy_used[i] = power_total[i] * dt
+    else:
+        energy_used[i] = energy_used[i-1] + 0.5*(power_total[i] + power_total[i-1]) * dt
+
+# Battery remaining fraction vs time
+battery_energy_J = E_batt_J
+battery_remaining_frac = np.maximum(0.0, 1.0 - energy_used / battery_energy_J)
+
+
+# Plotting
+
+plt.figure(figsize=(12,9))
+
+plt.subplot(3,1,1)
+plt.plot(t, x, label='x (m)')
+plt.plot(t, y, label='y (m)')
+plt.plot(t, z, label='z (m)')
+plt.plot(t, xref, '--', alpha=0.6, label='xref')
+plt.plot(t, yref, '--', alpha=0.6, label='yref')
+plt.plot(t, zref, '--', alpha=0.6, label='zref')
+plt.ylabel('Position (m)')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(3,1,2)
+plt.plot(t, phi, label='roll φ (rad)')
+plt.plot(t, theta, label='pitch θ (rad)')
+plt.plot(t, psi, label='yaw ψ (rad)')
+plt.plot(t, yaw_ref, '--', label='yaw_ref')
+plt.ylabel('Euler angles (rad)')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(3,1,3)
+plt.plot(t, np.degrees(psi), label='yaw (deg)')
+plt.plot(t, np.degrees(yaw_ref), '--', label='yaw_ref (deg)')
+plt.ylabel('Yaw (deg)')
+plt.xlabel('Time (s)')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.suptitle('Quadcopter CoM & Euler Angles vs Time', y=1.02)
+plt.show()
+
+# 3D trajectory plot
+from mpl_toolkits.mplot3d import Axes3D
+fig = plt.figure(figsize=(8,6))
+ax3 = fig.add_subplot(111, projection='3d')
+ax3.plot(x, y, z, label='trajectory')
+ax3.scatter([x[0], x[-1]], [y[0], y[-1]], [z[0], z[-1]], color='red', label='start/end')
+ax3.set_xlabel('X (m)')
+ax3.set_ylabel('Y (m)')
+ax3.set_zlabel('Z (m)')
+ax3.set_title('3D Trajectory (CoM)')
+ax3.legend()
+plt.show()
+
+#Plots for power and battery analysis
+
+plt.figure(figsize=(10,5))
+plt.plot(t, power_total, label='Total electrical power required (W)')
+plt.hlines(P_batt_max, t[0], t[-1], colors='r', linestyles='--', label=f'Battery max continuous ({P_batt_max:.0f} W)')
+plt.xlabel('Time (s)')
+plt.ylabel('Power (W)')
+plt.title('Power Requirement vs Battery Capability')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(10,4))
+plt.plot(t, battery_remaining_frac*100)
+plt.xlabel('Time (s)')
+plt.ylabel('Battery remaining (%)')
+plt.title('Estimated Remaining Battery Energy')
+plt.ylim(-5,105)
+plt.grid(True)
+plt.show()
+
+# summary
+peak_power = np.max(power_total)
+energy_used_total = energy_used[-1]
+print(f"Peak electrical power required during mission: {peak_power:.1f} W")
+print(f"Total electrical energy used (J): {energy_used_total:.0f} J -> {energy_used_total/3600:.3f} Wh")
+print(f"Battery nominal energy (Wh): {E_batt_J/3600:.3f} Wh")
+if peak_power <= P_batt_max and energy_used_total <= battery_energy_J:
+    print("Mission is within battery instantaneous power and stored energy limits (based on simplified model).")
+else:
+    print("Mission exceeds battery instantaneous power or stored energy limits (based on simplified model). Consider reducing demands or using a higher-power battery.")
