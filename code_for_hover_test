@@ -1,0 +1,114 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+m = 1.378        
+g = 9.81
+
+I_x = 0.02
+I_y = 0.02
+I_z = 0.04
+
+l = 0.225       
+k_T = 1.8e-5       
+k_M = 2.5e-6       
+
+dt = 0.005
+tf = 150
+N = int(tf / dt)
+
+
+Kp_z, Kd_z, Ki_z = 6.0, 4.5, 1.5
+Kp_phi, Kd_phi   = 4.0, 0.6
+Kp_th,  Kd_th    = 4.0, 0.6
+Kp_psi, Kd_psi   = 1.2, 0.25
+
+z_ref = 1.0
+
+
+t = np.arange(0, tf, dt)
+z = np.zeros(N); zd = np.zeros(N)
+phi = np.zeros(N); theta = np.zeros(N); psi = np.zeros(N)
+phi_d = np.zeros(N); th_d = np.zeros(N); psi_d = np.zeros(N)
+
+U1 = np.zeros(N); U2 = np.zeros(N); U3 = np.zeros(N); U4 = np.zeros(N)
+w = np.zeros((4, N))
+
+e_int = 0
+
+for k in range(N-1):
+
+    
+    e = z_ref - z[k]
+    e_int += e * dt
+    e_dot = -zd[k]
+
+    U1[k] = m*g + m*(Kp_z*e + Kd_z*e_dot + Ki_z*e_int)
+    U1[k] = max(0, U1[k])
+
+    U2[k] = Kp_phi*(-phi[k])   + Kd_phi*(-phi_d[k])
+    U3[k] = Kp_th*(-theta[k])  + Kd_th*(-th_d[k])
+    U4[k] = Kp_psi*(-psi[k])   + Kd_psi*(-psi_d[k])
+
+ 
+    T1 = (U1[k]/4) + (U3[k]/(2*l)) + (U4[k]/(4*k_M))
+    T2 = (U1[k]/4) - (U2[k]/(2*l)) - (U4[k]/(4*k_M))
+    T3 = (U1[k]/4) - (U3[k]/(2*l)) + (U4[k]/(4*k_M))
+    T4 = (U1[k]/4) + (U2[k]/(2*l)) - (U4[k]/(4*k_M))
+
+
+    T = np.maximum(np.array([T1, T2, T3, T4]), 0)
+    w[:, k] = np.sqrt(T / k_T)
+
+   
+    zdd = (U1[k]*np.cos(phi[k])*np.cos(theta[k]) - m*g) / m
+    zd[k+1] = zd[k] + zdd * dt
+    z[k+1]  = z[k] + zd[k+1] * dt
+
+    
+    phi_d[k+1]  = phi_d[k]  + (U2[k]/I_x) * dt
+    th_d[k+1]   = th_d[k]   + (U3[k]/I_y) * dt
+    psi_d[k+1]  = psi_d[k]  + (U4[k]/I_z) * dt
+
+    phi[k+1]  = phi[k]  + phi_d[k+1] * dt
+    theta[k+1] = theta[k] + th_d[k+1] * dt
+    psi[k+1]   = psi[k]  + psi_d[k+1] * dt
+
+
+
+plt.figure()
+plt.plot(t, z)
+plt.axhline(1.0, color='gray', linestyle='--')
+plt.title("Altitude vs Time")
+plt.xlabel("Time (s)")
+plt.ylabel("Altitude (m)")
+plt.grid()
+
+plt.figure()
+plt.plot(t, zd)
+plt.title("Vertical Velocity vs Time")
+plt.xlabel("Time (s)")
+plt.ylabel("Vertical Velocity (m/s)")
+plt.grid()
+
+plt.figure()
+plt.plot(t, phi, label="Roll")
+plt.plot(t, theta, label="Pitch")
+plt.plot(t, psi, label="Yaw")
+plt.legend()
+plt.title("Attitude Angles vs Time")
+plt.xlabel("Time (s)")
+plt.ylabel("Angle (rad)")
+plt.grid()
+
+plt.figure()
+plt.plot(t, w[0], label="Motor 1")
+plt.plot(t, w[1], label="Motor 2")
+plt.plot(t, w[2], label="Motor 3")
+plt.plot(t, w[3], label="Motor 4")
+plt.legend()
+plt.title("Rotor Speeds vs Time")
+plt.xlabel("Time (s)")
+plt.ylabel("Speed (rad/s)")
+plt.grid()
+
+plt.show()
