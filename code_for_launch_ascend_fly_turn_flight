@@ -1,459 +1,258 @@
-"""
-Quadcopter mission simulation and plotting.
-
-""" # Mission:
-# - Launch from ground, ascend vertically to z = 1.0 m
-#- Move straight at z = 1.0 m at average speed 1 m/s for 5 m
-# - Hover
-# - Yaw +90 deg left
-# - Move straight another 5 m
-# - Hover
-# - Land vertically with speed <= 0.01 m/s 
-
 import numpy as np
-from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from math import sin, cos, sqrt, pi
+
+class Params:
+    mass = 1.378          # kg
+    g = 9.81              # m/s^2
+    l = 0.225             # m (Arm length)
+    kt = 1.8e-5           # N / (rad/s)^2
+    km = 2.5e-6           # Nm / (rad/s)^2 (Motor drag constant)
+    
+    # Inertias
+    Ix = 0.02
+    Iy = 0.02
+    Iz = 0.04
+    
+    # Drag Constants
+    rho = 1.225           # Air density
+    Cd = 1.0              # Drag coeff (Assumed standard for flight)
+    A = 0.05              # Frontal Area (approx)
+    
+    # Power Limits
+    P_max = 1221.0        # Watts (V * I_max = 11.1 * 110)
+
+params = Params()
+
+class Gains:
+    # Altitude (Z)
+    kp_z = 2.0; kd_z = 1.5; ki_z = 0.05
+    # Position (X, Y) -> Output is Roll/Pitch ref
+    kp_xy = 0.4; kd_xy = 0.6
+    # Attitude (Roll, Pitch) Inner Loop
+    kp_att = 12.0; kd_att = 3.0
+    # Yaw
+    kp_psi = 2.0; kd_psi = 1.0
+
+gains = Gains()
+
+def simulation():
+    # Time settings
+    dt = 0.005  # 5ms timestep
+    T_max = 150.0 # Total simulation time
+    time_steps = int(T_max / dt)
+    t_arr = np.linspace(0, T_max, time_steps)
+    
+    # State Vector: [x, y, z, vx, vy, vz, phi, theta, psi, p, q, r]
+    state = np.zeros(12)
+    
+    # Integral error memory
+    int_err_z = 0
+    
+    # Data logging
+    log_pos = []
+    log_vel = []
+    log_att = [] # Defined: [phi, theta, psi]
+    log_power = []
+    log_time = []
+    
+    # Mission Phase Management (0=Takeoff, 6=Land)
+    phase = 0
+    
+    # Phase start time placeholders
+    t_phase_start = 0
+    t_hover_start = 0
+    t_move_y_start = 0
+    t_hover2_start = 0
+    t_land_start = 0
+    
+    print("Starting Simulation...")
+    
+    for i in range(time_steps):
+        t = t_arr[i]
+        x, y, z, vx, vy, vz, phi, theta, psi, p, q, r = state
+        
+        x_ref, y_ref, z_ref = 0, 0, 0
+        psi_ref = 0
+        
+        if phase == 0: # Takeoff to 1m
+            x_ref, y_ref, z_ref = 0, 0, 1.0
+            if z > 0.95: 
+                phase = 1
+                t_phase_start = t
+            
+        elif phase == 1: # Move X (5m at 1m/s)
+            time_in_phase = t - t_phase_start
+            x_ref = min(5.0, time_in_phase * 1.0) # 1m/s slope
+            y_ref, z_ref = 0, 1.0
+            if x > 4.95: 
+                phase = 2
+                t_hover_start = t
+            
+        elif phase == 2: # Hover 1
+            x_ref, y_ref, z_ref = 5.0, 0, 1.0
+            if t - t_hover_start > 2.0: 
+                phase = 3
+            
+        elif phase == 3: # Yaw 90 deg Left (pi/2)
+            x_ref, y_ref, z_ref = 5.0, 0, 1.0
+            psi_ref = np.pi/2
+            if abs(psi - np.pi/2) < 0.05: 
+                phase = 4
+                t_move_y_start = t
+            
+        elif phase == 4: # Move Y (5m)
+            time_in_phase = t - t_move_y_start
+            x_ref = 5.0
+            y_ref = min(5.0, time_in_phase * 1.0)
+            z_ref = 1.0
+            psi_ref = np.pi/2
+            if y > 4.95: 
+                phase = 5
+                t_hover2_start = t
+            
+        elif phase == 5: # Hover 2
+            x_ref, y_ref, z_ref = 5.0, 5.0, 1.0
+            psi_ref = np.pi/2
+            if t - t_hover2_start > 2.0: 
+                phase = 6
+                t_land_start = t
+            
+        elif phase == 6: # Land vertically at <= 1 cm/s
+            x_ref, y_ref = 5.0, 5.0
+            psi_ref = np.pi/2
+            # Set descent rate to 0.008 m/s (slower than 0.01 m/s limit)
+            z_ref = max(0.0, 1.0 - (t - t_land_start) * 0.008)
+            
+            # Kill motors if ground hit
+            if z <= 0.01: 
+                z_ref = 0
+        
+        # 1. Altitude Control (U1)
+        err_z = z_ref - z
+        derr_z = (0 - vz)
+        int_err_z += err_z * dt
+        U1 = params.mass * params.g + params.mass * (gains.kp_z * err_z + gains.kd_z * derr_z + gains.ki_z * int_err_z)
+        
+        # 2. Horizontal Position Control (Generates Phi_ref, Theta_ref)
+        ex = x_ref - x
+        ey = y_ref - y
+        
+        # Rotate errors to Body Frame
+        ex_body = cos(psi)*ex + sin(psi)*ey
+        ey_body = -sin(psi)*ex + cos(psi)*ey
+        
+        # PD for pos -> desired accel -> desired angle (small angle approx)
+        theta_ref = (gains.kp_xy * ex_body + gains.kd_xy * (0 - (cos(psi)*vx + sin(psi)*vy))) 
+        phi_ref = -(gains.kp_xy * ey_body + gains.kd_xy * (0 - (-sin(psi)*vx + cos(psi)*vy)))
+        
+        theta_ref = np.clip(theta_ref, -0.5, 0.5) # Clamp to approx 28 degrees
+        phi_ref = np.clip(phi_ref, -0.5, 0.5)
+        
+        # 3. Attitude Control (U2, U3, U4)
+        U2 = gains.kp_att * (phi_ref - phi) + gains.kd_att * (0 - p)     # Roll Torque
+        U3 = gains.kp_att * (theta_ref - theta) + gains.kd_att * (0 - q) # Pitch Torque
+        U4 = gains.kp_psi * (psi_ref - psi) + gains.kd_psi * (0 - r)     # Yaw Torque
+        
+        # Assuming near hover for power approximation
+        w_sq_avg = U1 / (4 * params.kt)
+        if w_sq_avg < 0: w_sq_avg = 0
+        w_avg = sqrt(w_sq_avg)
+        
+        # P_total = 4 * w_avg * Q_avg = 4 * w_avg * (km * w_avg^2) = 4 * km * w_avg^3
+        total_power = 4 * params.km * w_avg**3 
+        
+        # Drag D = 0.5 * rho * Cd * A * v^2
+        v_sq = vx**2 + vy**2 + vz**2
+        v_mag = sqrt(v_sq)
+        Fx_drag, Fy_drag, Fz_drag = 0,0,0
+        if v_mag > 0:
+            drag = 0.5 * params.rho * params.Cd * params.A * v_sq
+            Fx_drag = -drag * vx/v_mag
+            Fy_drag = -drag * vy/v_mag
+            Fz_drag = -drag * vz/v_mag
+            
+        # Acceleration (World Frame)
+        # Thrust component: F_T = R * [0, 0, U1]
+        ax = (cos(phi)*sin(theta)*cos(psi) + sin(phi)*sin(psi)) * U1 / params.mass + Fx_drag/params.mass
+        ay = (cos(phi)*sin(theta)*sin(psi) - sin(phi)*cos(psi)) * U1 / params.mass + Fy_drag/params.mass
+        az = -params.g + (cos(phi)*cos(theta)) * U1 / params.mass + Fz_drag/params.mass
+        
+        if z <= 0 and az < 0: # Ground collision check
+            az = 0; vz = 0; z = 0
+            
+        # Angular Acceleration
+        dp = (U2 - (params.Iz - params.Iy)*q*r)/params.Ix
+        dq = (U3 - (params.Ix - params.Iz)*p*r)/params.Iy
+        dr = (U4 - (params.Iy - params.Ix)*p*q)/params.Iz
+        
+        # Euler Integration
+        vx += ax*dt; vy += ay*dt; vz += az*dt
+        x += vx*dt; y += vy*dt; z += vz*dt
+        p += dp*dt; q += dq*dt; r += dr*dt
+        phi += p*dt; theta += q*dt; psi += r*dt
+        
+        # Store State
+        state = [x, y, z, vx, vy, vz, phi, theta, psi, p, q, r]
+        
+        log_pos.append([x, y, z])
+        log_vel.append([vx, vy, vz])
+        log_att.append([phi, theta, psi]) # Logging att here
+        log_power.append(total_power)
+        log_time.append(t)
+        
+        if phase == 6 and z <= 0.001 and t > t_land_start + 1.0:
+            print(f"Mission complete at t={t:.2f}s")
+            break
+
+    # Return the newly defined log_att
+    return np.array(log_time), np.array(log_pos), np.array(log_vel), np.array(log_att), np.array(log_power)
 
 
-m_frame = 0.395         # kg
-m_motor_each = 0.047    # kg (per motor)
-m_motors = 4 * m_motor_each
-m_props_total = 0.055   # kg (total for 4)
-m_esc_each = 0.05       # kg (per ESC)
-m_escs = 4 * m_esc_each
-m_battery = 0.23        # kg
-m_fc = 0.31             # kg (flight controller)
+t, pos, vel, att, pwr = simulation() 
 
-m_total = m_frame + m_motors + m_props_total + m_escs + m_battery + m_fc
+# Create a 2x2 Plot Grid
+fig = plt.figure(figsize=(12, 10))
 
-print(f"Total vehicle mass assumed: {m_total:.3f} kg")
+# Plot 1: 3D Trajectory
+ax1 = fig.add_subplot(221, projection='3d')
+ax1.plot(pos[:,0], pos[:,1], pos[:,2], label='Drone Trajectory')
+ax1.set_title('3D Flight Path')
+ax1.set_xlabel('X (m)'); ax1.set_ylabel('Y (m)'); ax1.set_zlabel('Z (m)')
 
-g = 9.81  # m/s^2
-# approximate rotational inertias (kg*m^2)
-Ixx = 0.02
-Iyy = 0.02
-Izz = 0.04
-
-# Prop / motor / battery parameters (NEW)
-# thrust and motor torque coefficients (typical small-quad values)
-kT = 1.8e-5    # thrust [N] = kT * omega^2 (omega in rad/s)
-kM = 2.5e-6    # torque constant used to estimate mech power: P_mech ~ kM * omega^3
-
-motor_efficiency = 0.72   # combined motor+ESC efficiency (electrical -> mechanical)
-
-# Battery: Spektrum 11.1V 2200mAh 3S 50C
-V_nom = 11.1             # nominal voltage
-capacity_Ah = 2.2        # Ah
-C_rating = 50            # continuous
-I_cont_max = capacity_Ah * C_rating    # A
-P_batt_max = V_nom * I_cont_max        # W (max continuous electric power available)
-E_batt_J = V_nom * capacity_Ah * 3600  # Joules stored (nominal)
-
-print(f"Battery max continuous current: {I_cont_max:.1f} A")
-print(f"Battery max continuous power: {P_batt_max:.1f} W")
-print(f"Battery nominal energy: {E_batt_J/3600:.2f} Wh ({E_batt_J:.0f} J)")
-
-
-Cd_trans = 0.15   # translational linear drag coefficient (N per (m/s))
-# simple damping model
-
-# Position controller gains (PD)
-Kp_xy = 6.0
-Kd_xy = 4.0
-
-Kp_z = 25.0
-Kd_z = 10.0
-
-# Attitude (angle) controller gains
-Kp_ang = np.array([8.0, 8.0, 3.0])   # [roll, pitch, yaw]
-Kd_ang = np.array([2.5, 2.5, 1.0])
-
-
-# Mission timing and reference generation
-t_up = 3.0
-t_cruise1 = 5.0
-t_hover1 = 2.0
-t_yaw = 2.0
-t_cruise2 = 5.0
-t_hover2 = 2.0
-t_land = 6.0
-
-dt = 0.02
-t_phases = [t_up, t_cruise1, t_hover1, t_yaw, t_cruise2, t_hover2, t_land]
-T_total = sum(t_phases)
-t = np.arange(0, T_total + dt/2, dt)
-
-x0, y0, z0 = 0.0, 0.0, 0.0
-z_hover = 1.0
-v_cruise = 1.0
-
-xref = np.zeros_like(t)
-yref = np.zeros_like(t)
-zref = np.zeros_like(t)
-vx_ref = np.zeros_like(t)
-vy_ref = np.zeros_like(t)
-vz_ref = np.zeros_like(t)
-yaw_ref = np.zeros_like(t)
-yaw_rate_ref = np.zeros_like(t)
-
-idx = 0
-current_x = x0
-current_y = y0
-current_yaw = 0.0
-
-for phase, dur in zip(["up","cruise1","hover1","yaw","cruise2","hover2","land"], t_phases):
-    n_steps = int(np.round(dur / dt))
-    times = np.arange(n_steps) * dt
-    if phase == "up":
-        z_traj = z0 + (z_hover - z0) * (times / dur)
-        vz_traj = (z_hover - z0) / dur * np.ones_like(times)
-        x_traj = current_x + 0*times
-        y_traj = current_y + 0*times
-        yaw_traj = current_yaw + 0*times
-    elif phase == "cruise1":
-        dx = v_cruise * times
-        x_traj = current_x + dx
-        vx_traj = v_cruise * np.ones_like(times)
-        y_traj = current_y + 0*times
-        z_traj = z_hover + 0*times
-        vz_traj = 0*times
-        yaw_traj = current_yaw + 0*times
-        vy_traj = 0*times
-    elif phase == "hover1":
-        x_traj = current_x + v_cruise * dur * np.ones_like(times)
-        vx_traj = 0*times
-        y_traj = current_y + 0*times
-        z_traj = z_hover + 0*times
-        vz_traj = 0*times
-        yaw_traj = current_yaw + 0*times
-        vy_traj = 0*times
-    elif phase == "yaw":
-        yaw_start = current_yaw
-        yaw_end = current_yaw + np.pi/2.0
-        yaw_traj = yaw_start + (yaw_end - yaw_start) * (times / dur)
-        yaw_rate_traj = (yaw_end - yaw_start) / dur * np.ones_like(times)
-        x_traj = current_x + v_cruise * dur * np.ones_like(times)
-        vx_traj = 0*times
-        y_traj = current_y + 0*times
-        z_traj = z_hover + 0*times
-        vz_traj = 0*times
-        vy_traj = 0*times
-    elif phase == "cruise2":
-        dy = v_cruise * times
-        x_traj = current_x + v_cruise * dur * np.ones_like(times)
-        y_traj = current_y + dy
-        vx_traj = 0*times
-        vy_traj = v_cruise * np.ones_like(times)
-        z_traj = z_hover + 0*times
-        vz_traj = 0*times
-        yaw_traj = current_yaw + np.pi/2.0 + 0*times
-    elif phase == "hover2":
-        x_traj = current_x + v_cruise * dur * np.ones_like(times)
-        y_traj = current_y + v_cruise * dur * np.ones_like(times)
-        vx_traj = 0*times
-        vy_traj = 0*times
-        z_traj = z_hover + 0*times
-        vz_traj = 0*times
-        yaw_traj = current_yaw + np.pi/2.0 + 0*times
-    elif phase == "land":
-        z_traj = z_hover * (1.0 - (times / dur)**2)
-        vz_traj = np.gradient(z_traj, dt)
-        x_traj = current_x + v_cruise * dur * np.ones_like(times)
-        y_traj = current_y + v_cruise * dur * np.ones_like(times)
-        vx_traj = 0*times
-        vy_traj = 0*times
-        yaw_traj = current_yaw + np.pi/2.0 + 0*times
+# Plot 2: Landing Velocity Check
+ax2 = fig.add_subplot(222)
+# Find index where landing phase begins to focus the plot
+if t.size > 0:
+    landing_start_time = t[-1] - 15.0 
+    landing_start_idx = np.where(t >= landing_start_time)[0]
+    if landing_start_idx.size > 0:
+        landing_start_idx = landing_start_idx[0]
+        ax2.plot(t[landing_start_idx:], vel[landing_start_idx:, 2])
     else:
-        x_traj = current_x + 0*times
-        y_traj = current_y + 0*times
-        z_traj = z_hover + 0*times
-        vx_traj = 0*times
-        vy_traj = 0*times
-        vz_traj = 0*times
-        yaw_traj = current_yaw + 0*times
+        ax2.plot(t, vel[:, 2]) # Fallback if mission is too short
+    
+ax2.axhline(-0.01, color='r', linestyle='--', label='Limit (-1 cm/s)')
+ax2.set_title('Landing Vertical Velocity')
+ax2.set_xlabel('Time (s)'); ax2.set_ylabel('Vz (m/s)'); ax2.grid(True); ax2.legend()
 
-    n_avail = len(times)
-    j0 = idx
-    j1 = idx + n_avail
-    if 'vx_traj' not in locals(): vx_traj = np.zeros(n_avail)
-    if 'vy_traj' not in locals(): vy_traj = np.zeros(n_avail)
-    if 'vz_traj' not in locals(): vz_traj = np.zeros(n_avail)
-    if 'yaw_traj' not in locals(): yaw_traj = np.zeros(n_avail)
-    if 'yaw_rate_traj' not in locals(): yaw_rate_traj = np.zeros(n_avail)
+# Plot 3: Euler Angles (phi, theta, psi)
+ax3 = fig.add_subplot(223)
+ax3.plot(t, np.degrees(att[:,0]), label='Roll ($\phi$)')
+ax3.plot(t, np.degrees(att[:,1]), label='Pitch ($\\theta$)')
+ax3.plot(t, np.degrees(att[:,2]), label='Yaw ($\psi$)')
+ax3.set_title('Euler Angles vs Time')
+ax3.set_xlabel('Time (s)'); ax3.set_ylabel('Angle (degrees)') # Plot in degrees for clarity
+ax3.legend(); ax3.grid(True)
+# 
 
-    xref[j0:j1] = x_traj
-    yref[j0:j1] = y_traj
-    zref[j0:j1] = z_traj
-    vx_ref[j0:j1] = vx_traj
-    vy_ref[j0:j1] = vy_traj
-    vz_ref[j0:j1] = vz_traj
-    yaw_ref[j0:j1] = yaw_traj
-    yaw_rate_ref[j0:j1] = yaw_rate_traj
-
-    idx = j1
-    current_x = xref[j1-1]
-    current_y = yref[j1-1]
-    current_yaw = yaw_ref[j1-1]
-
-    for v in ['vx_traj','vy_traj','vz_traj','yaw_traj','yaw_rate_traj']:
-        if v in locals():
-            del locals()[v]
-
-# Dynamical model
-def wrap_angle(a):
-    return (a + np.pi) % (2*np.pi) - np.pi
-
-def dynamics(ti, state):
-    # linear interpolation of references at time ti
-    idx = int(np.floor(ti / dt))
-    if idx >= len(t): idx = len(t)-1
-    x_d = xref[idx]; y_d = yref[idx]; z_d = zref[idx]
-    vx_d = vx_ref[idx]; vy_d = vy_ref[idx]; vz_d = vz_ref[idx]
-    yaw_d = yaw_ref[idx]; yaw_rate_d = yaw_rate_ref[idx]
-
-    # unpack state
-    x, y, z, xd, yd, zd, phi, theta, psi, p, q, r = state
-
-    # position errors and derivative errors
-    ex = x_d - x
-    ey = y_d - y
-    ez = z_d - z
-    evx = vx_d - xd
-    evy = vy_d - yd
-    evz = vz_d - zd
-
-    # desired horizontal accelerations from PD
-    ax_des = Kp_xy * ex + Kd_xy * evx
-    ay_des = Kp_xy * ey + Kd_xy * evy
-    # desired vertical acceleration
-    az_des = Kp_z * ez + Kd_z * evz
-
-    # desired angles (small-angle mapping). Note: psi is current yaw used in transform
-    phi_des = (ax_des * np.sin(psi) - ay_des * np.cos(psi)) / g
-    theta_des = (ax_des * np.cos(psi) + ay_des * np.sin(psi)) / g
-    # clamp small angles
-    max_angle = np.radians(20.0)
-    phi_des = np.clip(phi_des, -max_angle, max_angle)
-    theta_des = np.clip(theta_des, -max_angle, max_angle)
-
-    # angle errors
-    e_phi = phi_des - phi
-    e_theta = theta_des - theta
-    # yaw error (wrap)
-    e_psi = wrap_angle(yaw_d - psi)
-
-    # PD for angular accelerations -> torques
-    ang_rates = np.array([p, q, r])
-    e_angles = np.array([e_phi, e_theta, e_psi])
-    tau = Kp_ang * e_angles - Kd_ang * ang_rates  # tau_x, tau_y, tau_z
-
-    # map torques to angular accelerations
-    p_dot = tau[0] / Ixx
-    q_dot = tau[1] / Iyy
-    r_dot = tau[2] / Izz
-
-    # thrust needed to produce desired vertical acceleration (in world Z)
-    cosphi = np.cos(phi); costheta = np.cos(theta)
-    denom = cosphi * costheta
-    if np.abs(denom) < 1e-6:
-        denom = 1e-6
-    T = m_total * (g + az_des) / denom
-    T = max(0.0, T)
-
-    # acceleration in inertial frame from thrust rotated by current Euler angles
-    # include simple translational drag proportional to velocity (linear damping)
-    ax = (T / m_total) * np.sin(theta) - (Cd_trans / m_total) * xd
-    ay = (T / m_total) * (-np.sin(phi) * np.cos(theta)) - (Cd_trans / m_total) * yd
-    az = (T / m_total) * (np.cos(phi) * np.cos(theta)) - g - (Cd_trans / m_total) * zd
-
-    # state derivatives
-    x_dot = xd
-    y_dot = yd
-    z_dot = zd
-    xd_dot = ax
-    yd_dot = ay
-    zd_dot = az
-
-    # Euler angle kinematics (body rates -> Euler derivatives)
-    phi_dot = p + q * np.sin(phi) * np.tan(theta) + r * np.cos(phi) * np.tan(theta)
-    theta_dot = q * np.cos(phi) - r * np.sin(phi)
-    psi_dot = q * np.sin(phi) / np.cos(theta) + r * np.cos(phi) / np.cos(theta)
-
-    return [x_dot, y_dot, z_dot, xd_dot, yd_dot, zd_dot, phi_dot, theta_dot, psi_dot, p_dot, q_dot, r_dot]
-
-# Initial state
-state0 = np.zeros(12)
-state0[2] = 0.0   # z
-
-# integrate
-sol = solve_ivp(dynamics, (0.0, T_total), state0, t_eval=t, rtol=1e-6, atol=1e-6)
-
-# extract results
-x = sol.y[0]
-y = sol.y[1]
-z = sol.y[2]
-xd = sol.y[3]
-yd = sol.y[4]
-zd = sol.y[5]
-phi = sol.y[6]
-theta = sol.y[7]
-psi = sol.y[8]
-p = sol.y[9]
-q = sol.y[10]
-r = sol.y[11]
-
-# Recompute per-time required thrusts and power (post-process)
-# Reuse the same control law used in dynamics to compute az_des -> T
-power_total = np.zeros_like(t)
-power_per_motor = np.zeros((len(t), 4))
-thrust_per_motor = np.zeros((len(t), 4))
-omega_per_motor = np.zeros((len(t), 4))
-energy_used = np.zeros_like(t)
-
-for i, ti in enumerate(t):
-    # get references
-    x_d = xref[i]; y_d = yref[i]; z_d = zref[i]
-    vx_d = vx_ref[i]; vy_d = vy_ref[i]; vz_d = vz_ref[i]
-    yaw_d = yaw_ref[i]
-
-    # current states (from solution)
-    xi = x[i]; yi = y[i]; zi = z[i]
-    xdi = xd[i]; ydi = yd[i]; zdi = zd[i]
-    phii = phi[i]; thetai = theta[i]; psii = psi[i]
-    pi = p[i]; qi = q[i]; ri = r[i]
-
-    # errors
-    ex = x_d - xi
-    ey = y_d - yi
-    ez = z_d - zi
-    evx = vx_d - xdi
-    evy = vy_d - ydi
-    evz = vz_d - zdi
-
-    ax_des = Kp_xy * ex + Kd_xy * evx
-    ay_des = Kp_xy * ey + Kd_xy * evy
-    az_des = Kp_z * ez + Kd_z * evz
-
-    phi_des = (ax_des * np.sin(psii) - ay_des * np.cos(psii)) / g
-    theta_des = (ax_des * np.cos(psii) + ay_des * np.sin(psii)) / g
-    max_angle = np.radians(20.0)
-    phi_des = np.clip(phi_des, -max_angle, max_angle)
-    theta_des = np.clip(theta_des, -max_angle, max_angle)
-
-    # compute total thrust required
-    cosphi = np.cos(phii); costheta = np.cos(thetai)
-    denom = cosphi * costheta
-    if np.abs(denom) < 1e-6:
-        denom = 1e-6
-    T_req = m_total * (g + az_des) / denom
-    T_req = max(0.0, T_req)
-
-    # per-rotor thrust (quad-X equally distributes thrust nominally)
-    Ti = T_req / 4.0
-    Ti = max(0.0, Ti)
-
-    # rotor speed from thrust constant
-    # protect from unrealistic values
-    omega_i = np.sqrt(np.clip(Ti / kT, 0, (5000.0)**2))  # rad/s (cap to a reasonable max)
-    # estimate mechanical power per rotor: P_mech ~ torque*omega ~ kM*omega^3
-    P_mech_i = kM * (omega_i**3)
-    # electrical power per rotor (account for efficiency)
-    P_elec_i = P_mech_i / max(motor_efficiency, 1e-3)
-
-    # store
-    thrust_per_motor[i,:] = Ti
-    omega_per_motor[i,:] = omega_i
-    power_per_motor[i,:] = P_elec_i
-    power_total[i] = np.sum(P_elec_i)
-
-    # integrate energy used (somewhat trapezoidal using dt)
-    if i == 0:
-        energy_used[i] = power_total[i] * dt
-    else:
-        energy_used[i] = energy_used[i-1] + 0.5*(power_total[i] + power_total[i-1]) * dt
-
-# Battery remaining fraction vs time
-battery_energy_J = E_batt_J
-battery_remaining_frac = np.maximum(0.0, 1.0 - energy_used / battery_energy_J)
-
-
-# Plotting
-
-plt.figure(figsize=(12,9))
-
-plt.subplot(3,1,1)
-plt.plot(t, x, label='x (m)')
-plt.plot(t, y, label='y (m)')
-plt.plot(t, z, label='z (m)')
-plt.plot(t, xref, '--', alpha=0.6, label='xref')
-plt.plot(t, yref, '--', alpha=0.6, label='yref')
-plt.plot(t, zref, '--', alpha=0.6, label='zref')
-plt.ylabel('Position (m)')
-plt.legend()
-plt.grid(True)
-
-plt.subplot(3,1,2)
-plt.plot(t, phi, label='roll φ (rad)')
-plt.plot(t, theta, label='pitch θ (rad)')
-plt.plot(t, psi, label='yaw ψ (rad)')
-plt.plot(t, yaw_ref, '--', label='yaw_ref')
-plt.ylabel('Euler angles (rad)')
-plt.legend()
-plt.grid(True)
-
-plt.subplot(3,1,3)
-plt.plot(t, np.degrees(psi), label='yaw (deg)')
-plt.plot(t, np.degrees(yaw_ref), '--', label='yaw_ref (deg)')
-plt.ylabel('Yaw (deg)')
-plt.xlabel('Time (s)')
-plt.legend()
-plt.grid(True)
+# Plot 4: Power Consumption
+ax4 = fig.add_subplot(224)
+ax4.plot(t, pwr)
+ax4.axhline(params.P_max, color='r', linestyle='--', label='Battery Max Limit (1221 W)')
+ax4.set_title('Power Consumption')
+ax4.set_xlabel('Time (s)'); ax4.set_ylabel('Watts'); ax4.grid(True)
 
 plt.tight_layout()
-plt.suptitle('Quadcopter CoM & Euler Angles vs Time', y=1.02)
 plt.show()
-
-# 3D trajectory plot
-from mpl_toolkits.mplot3d import Axes3D
-fig = plt.figure(figsize=(8,6))
-ax3 = fig.add_subplot(111, projection='3d')
-ax3.plot(x, y, z, label='trajectory')
-ax3.scatter([x[0], x[-1]], [y[0], y[-1]], [z[0], z[-1]], color='red', label='start/end')
-ax3.set_xlabel('X (m)')
-ax3.set_ylabel('Y (m)')
-ax3.set_zlabel('Z (m)')
-ax3.set_title('3D Trajectory (CoM)')
-ax3.legend()
-plt.show()
-
-#Plots for power and battery analysis
-
-plt.figure(figsize=(10,5))
-plt.plot(t, power_total, label='Total electrical power required (W)')
-plt.hlines(P_batt_max, t[0], t[-1], colors='r', linestyles='--', label=f'Battery max continuous ({P_batt_max:.0f} W)')
-plt.xlabel('Time (s)')
-plt.ylabel('Power (W)')
-plt.title('Power Requirement vs Battery Capability')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-plt.figure(figsize=(10,4))
-plt.plot(t, battery_remaining_frac*100)
-plt.xlabel('Time (s)')
-plt.ylabel('Battery remaining (%)')
-plt.title('Estimated Remaining Battery Energy')
-plt.ylim(-5,105)
-plt.grid(True)
-plt.show()
-
-# summary
-peak_power = np.max(power_total)
-energy_used_total = energy_used[-1]
-print(f"Peak electrical power required during mission: {peak_power:.1f} W")
-print(f"Total electrical energy used (J): {energy_used_total:.0f} J -> {energy_used_total/3600:.3f} Wh")
-print(f"Battery nominal energy (Wh): {E_batt_J/3600:.3f} Wh")
-if peak_power <= P_batt_max and energy_used_total <= battery_energy_J:
-    print("Mission is within battery instantaneous power and stored energy limits (based on simplified model).")
-else:
-    print("Mission exceeds battery instantaneous power or stored energy limits (based on simplified model). Consider reducing demands or using a higher-power battery.")
