@@ -1,0 +1,164 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from math import sin, cos, sqrt
+from mpl_toolkits.mplot3d import Axes3D
+
+#parameters
+m = 1.378
+g = 9.81
+l = 0.225
+kt = 1.8e-5
+km = 2.5e-6
+
+Ix = 0.02
+Iy = 0.02
+Iz = 0.04
+
+#gains
+kp_z, kd_z, ki_z = 2.0, 1.5, 0.5
+kp_xy, kd_xy = 0.6, 0.4
+kp_att, kd_att = 12.0, 3.0
+kp_psi, kd_psi = 2.0, 1.0
+
+#circle trajectory
+
+R = 2.0               # radius (m)
+z_ref = 1.0           # altitude (m)
+v = 0.5               # desired tangential speed (m/s)
+omega = v / R         # angular rate
+
+
+#simulation timing
+
+dt = 0.005
+T_final = 75.0        # 1 minute minimum
+N = int(T_final / dt)
+
+#State vector
+# x, y, z, vx, vy, vz, phi, theta, psi, p, q, r
+state = np.zeros(12)
+
+# Logging
+pos_log = np.zeros((N,3))
+vel_log = np.zeros((N,3))
+att_log = np.zeros((N,3))
+spd_log = np.zeros(N)
+time = np.linspace(0, T_final, N)
+
+int_err_z = 0.0
+
+
+#SIMULATION
+
+for k in range(N):
+    t = time[k]
+    x, y, z, vx, vy, vz, phi, theta, psi, p, q, r = state
+
+    #desired circle positions
+    x_ref = R * np.cos(omega * t)
+    y_ref = R * np.sin(omega * t)
+    z_ref = 1.0
+    
+    #altitude control
+    ez = z_ref - z
+    dez = -vz
+    int_err_z += ez * dt
+
+    U1 = m*g + m*(kp_z*ez + kd_z*dez + ki_z*int_err_z)
+    U1 = max(0.0, U1)
+
+    #position control
+    ex = x_ref - x
+    ey = y_ref - y
+
+    #Convert velocity into world frame magnitude for derivative
+    vx_w = vx
+    vy_w = vy
+
+    theta_ref = kp_xy*ex + kd_xy*(-vx_w)
+    phi_ref   = -(kp_xy*ey + kd_xy*(-vy_w))
+
+    theta_ref = np.clip(theta_ref, -0.4, 0.4)
+    phi_ref   = np.clip(phi_ref, -0.4, 0.4)
+
+    psi_ref = 0.0
+
+    #attitude control (U2, U3, U4)
+    U2 = kp_att*(phi_ref - phi)   + kd_att*(0 - p)
+    U3 = kp_att*(theta_ref - theta) + kd_att*(0 - q)
+    U4 = kp_psi*(psi_ref - psi)   + kd_psi*(0 - r)
+
+    #Compute acceleration from rotor forces
+    ax = (cos(phi)*sin(theta)*cos(psi) + sin(phi)*sin(psi)) * U1/m
+    ay = (cos(phi)*sin(theta)*sin(psi) - sin(phi)*cos(psi)) * U1/m
+    az = -g + (cos(phi)*cos(theta))*U1/m
+
+    #rotational acceleration
+    dp = (U2 - (Iz - Iy)*q*r) / Ix
+    dq = (U3 - (Ix - Iz)*p*r) / Iy
+    dr = (U4 - (Iy - Ix)*p*q) / Iz
+    
+    #euler integrations
+    vx += ax*dt; x += vx*dt
+    vy += ay*dt; y += vy*dt
+    vz += az*dt; z += vz*dt
+
+    p += dp*dt; phi += p*dt
+    q += dq*dt; theta += q*dt
+    r += dr*dt; psi += r*dt
+
+    # save state
+    state = np.array([x,y,z,vx,vy,vz,phi,theta,psi,p,q,r])
+
+    pos_log[k] = [x,y,z]
+    vel_log[k] = [vx,vy,vz]
+    att_log[k] = [phi,theta,psi]
+    spd_log[k] = np.sqrt(vx**2 + vy**2 + vz**2)
+
+#PLOTS
+
+plt.figure(figsize=(12,6))
+plt.plot(time, pos_log[:,0], label="x(t)")
+plt.plot(time, pos_log[:,1], label="y(t)")
+plt.plot(time, pos_log[:,2], label="z(t)")
+plt.title("Position vs Time")
+plt.xlabel("Time (s)")
+plt.ylabel("Position (m)")
+plt.legend()
+plt.grid()
+
+plt.figure(figsize=(10,5))
+plt.plot(time, spd_log)
+plt.title("Speed vs Time")
+plt.xlabel("Time (s)")
+plt.ylabel("Speed (m/s)")
+plt.grid()
+
+plt.figure(figsize=(12,6))
+plt.plot(time, att_log[:,0], label="Roll φ")
+plt.plot(time, att_log[:,1], label="Pitch θ")
+plt.plot(time, att_log[:,2], label="Yaw ψ")
+plt.title("Attitude vs Time")
+plt.xlabel("Time (s)")
+plt.ylabel("Angle (rad)")
+plt.legend()
+plt.grid()
+
+plt.show()
+
+fig = plt.figure(figsize=(10, 7))
+ax = fig.add_subplot(111, projection='3d')
+
+ax.plot(pos_log[:,0], pos_log[:,1], pos_log[:,2], linewidth=2)
+
+# Reference circle for visualization (optional)
+theta = np.linspace(0, 2*np.pi, 300)
+ax.plot(2*np.cos(theta), 2*np.sin(theta), np.ones_like(theta),
+        'r--', alpha=0.4, label='Reference Circle')
+
+ax.set_title("3D Trajectory of Circular Motion")
+ax.set_xlabel("X (m)")
+ax.set_ylabel("Y (m)")
+ax.set_zlabel("Z (m)", labelpad=0)
+ax.legend()
+ax.grid(True)
